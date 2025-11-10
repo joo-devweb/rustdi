@@ -1,0 +1,244 @@
+use crate::errors::*;
+use crate::session::Session;
+use ring::{agreement, digest, hmac, hkdf, rand};
+use std::sync::Arc;
+
+/// Tahapan handshake Noise
+#[derive(Debug, Clone, PartialEq)]
+pub enum HandshakeState {
+    /// Belum memulai handshake
+    Idle,
+    /// Telah mengirim Client Hello
+    ClientHelloSent,
+    /// Telah menerima Server Hello
+    ServerHelloReceived,
+    /// Telah mengirim Client Finish
+    ClientFinishSent,
+    /// Handshake selesai
+    Complete,
+}
+
+/// Struktur untuk handshake
+pub struct Handshake {
+    state: HandshakeState,
+    client_keys: Option<ClientKeys>,
+    server_keys: Option<ServerKeys>,
+    shared_secret: Option<Vec<u8>>,
+}
+
+#[derive(Debug)]
+struct ClientKeys {
+    ephemeral_private: agreement::EphemeralPrivateKey,
+    ephemeral_public: Vec<u8>,
+    static_private: agreement::EphemeralPrivateKey,
+    static_public: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct ServerKeys {
+    ephemeral_public: Vec<u8>,
+    static_encrypted: Vec<u8>,
+    certificate_encrypted: Vec<u8>,
+}
+
+impl Handshake {
+    /// Membuat instance handshake baru
+    pub fn new() -> Result<Self> {
+        Ok(Handshake {
+            state: HandshakeState::Idle,
+            client_keys: None,
+            server_keys: None,
+            shared_secret: None,
+        })
+    }
+
+    /// Memulai handshake Noise
+    pub fn start(&mut self) -> Result<Vec<u8>> {
+        if self.state != HandshakeState::Idle {
+            return Err("Handshake already started".into());
+        }
+
+        // Generate keys
+        let client_keys = self.generate_client_keys()?;
+        self.client_keys = Some(client_keys.clone());
+
+        // Bangun ClientHello message
+        let mut message = vec![0x01]; // Type: ClientHello
+        message.extend_from_slice(&[0x00, 0x01]); // Version: 1
+        message.extend_from_slice(&client_keys.ephemeral_public);
+
+        self.state = HandshakeState::ClientHelloSent;
+        Ok(message)
+    }
+
+    /// Proses ServerHello yang diterima dari server
+    pub fn process_server_hello(&mut self, server_hello: &[u8]) -> Result<Vec<u8>> {
+        if self.state != HandshakeState::ClientHelloSent {
+            return Err("Invalid handshake state for processing server hello".into());
+        }
+
+        if server_hello.len() < 1 {
+            return Err("Server hello message too short".into());
+        }
+
+        // Parse server hello
+        let server_keys = self.parse_server_hello(server_hello)?;
+        self.server_keys = Some(server_keys.clone());
+
+        // Compute shared secret using server ephemeral public key
+        let client_keys = self.client_keys.as_ref().ok_or("Client keys not available")?;
+        let shared_secret = self.compute_shared_secret(
+            &client_keys.ephemeral_private,
+            &server_keys.ephemeral_public
+        )?;
+
+        self.shared_secret = Some(shared_secret.clone());
+
+        // Decrypt server's static key using shared secret and client's static key
+        let decrypted_static = self.decrypt_server_static(&shared_secret, &server_keys.static_encrypted)?;
+
+        // Validate server certificate
+        self.validate_server_certificate(&server_keys.certificate_encrypted, &shared_secret)?;
+
+        // Bangun ClientFinish message
+        let mut finish_message = vec![0x02]; // Type: ClientFinish
+        finish_message.extend_from_slice(&client_keys.static_public);
+
+        // Buat dan enkripsi payload (containing tokens, etc.)
+        let client_payload = self.build_client_payload()?;
+        let encrypted_payload = self.encrypt_payload(&client_payload, &shared_secret)?;
+        finish_message.extend_from_slice(&encrypted_payload);
+
+        self.state = HandshakeState::ClientFinishSent;
+        Ok(finish_message)
+    }
+
+    /// Selesaikan handshake setelah mengirim ClientFinish
+    pub fn finalize(&mut self, session: &mut Session) -> Result<()> {
+        if self.state != HandshakeState::ClientFinishSent {
+            return Err("Invalid handshake state for finalization".into());
+        }
+
+        // Generate final session keys
+        let shared_secret = self.shared_secret.as_ref().ok_or("Shared secret not available")?;
+        let final_keys = self.derive_final_keys(shared_secret)?;
+
+        // Update session dengan kunci baru
+        session.update_encryption_keys(final_keys.enc_key, final_keys.mac_key);
+
+        self.state = HandshakeState::Complete;
+        Ok(())
+    }
+
+    /// Cek apakah handshake selesai
+    pub fn is_complete(&self) -> bool {
+        self.state == HandshakeState::Complete
+    }
+
+    fn generate_client_keys(&mut self) -> Result<ClientKeys> {
+        let rng = rand::SystemRandom::new();
+
+        // Generate ephemeral key pair
+        let ephemeral_private = agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng)
+            .map_err(|_| "Failed to generate ephemeral private key")?;
+        let ephemeral_public = ephemeral_private.compute_public_key()
+            .map_err(|_| "Failed to compute ephemeral public key")?
+            .as_ref().to_vec();
+
+        // Generate static key pair
+        let static_private = agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng)
+            .map_err(|_| "Failed to generate static private key")?;
+        let static_public = static_private.compute_public_key()
+            .map_err(|_| "Failed to compute static public key")?
+            .as_ref().to_vec();
+
+        Ok(ClientKeys {
+            ephemeral_private,
+            ephemeral_public,
+            static_private,
+            static_public,
+        })
+    }
+
+    fn parse_server_hello(&self, hello: &[u8]) -> Result<ServerKeys> {
+        
+        if hello.len() < 33 { // minimal 1 byte header + 32 byte public key
+            return Err("Server hello too short".into());
+        }
+
+        // Ambil public key dari server (32 byte)
+        let ephemeral_public = hello[1..33].to_vec();
+
+        // Ambil encrypted static key dan certificate
+        let static_encrypted_start = 33;
+        let static_encrypted_end = hello.len(); // dalam implementasi nyata akan lebih kompleks
+        let static_encrypted = hello[static_encrypted_start..static_encrypted_end.min(hello.len())].to_vec();
+
+        
+        let certificate_encrypted = Vec::new(); // Placeholder
+
+        Ok(ServerKeys {
+            ephemeral_public,
+            static_encrypted,
+            certificate_encrypted,
+        })
+    }
+
+    fn compute_shared_secret(
+        &self,
+        private_key: &agreement::EphemeralPrivateKey,
+        server_public: &[u8]
+    ) -> Result<Vec<u8>> {
+        let server_public_key = agreement::UnparsedPublicKey::new(&agreement::X25519, server_public);
+        let shared_secret = agreement::agree_ephemeral(
+            private_key.clone(),
+            &server_public_key,
+            |shared_secret| shared_secret.to_vec(),
+        ).map_err(|_| "Failed to compute shared secret")?;
+
+        Ok(shared_secret)
+    }
+
+    fn decrypt_server_static(&self, shared_secret: &[u8], encrypted_static: &[u8]) -> Result<Vec<u8>> {
+        // Dalam implementasi nyata, akan dilakukan dekripsi aktual
+        // Ini hanya placeholder
+        Ok(encrypted_static.to_vec())
+    }
+
+    fn validate_server_certificate(&self, encrypted_cert: &[u8], shared_secret: &[u8]) -> Result<()> {
+        // Dalam implementasi nyata, akan dilakukan validasi sertifikat
+        // Placeholder - selalu sukses
+        Ok(())
+    }
+
+    fn build_client_payload(&self) -> Result<Vec<u8>> {
+        // Bangun payload klien berisi token, identitas, dll.
+        // Ini hanya placeholder
+        Ok(vec![0x01, 0x02, 0x03, 0x04]) // Placeholder
+    }
+
+    fn encrypt_payload(&self, payload: &[u8], shared_secret: &[u8]) -> Result<Vec<u8>> {
+        // Dalam implementasi nyata, akan menggunakan cipher yang sesuai
+        // Ini hanya placeholder
+        Ok(payload.to_vec())
+    }
+
+    fn derive_final_keys(&self, shared_secret: &[u8]) -> Result<crate::crypto::SessionKeys> {
+        // Gunakan HKDF untuk menurunkan kunci final dari secret bersama
+        let salt = [0u8; 32]; // Salt nol seperti dalam protokol WhatsApp
+        let hkdf_salt = hkdf::Salt::new(hkdf::HKDF_SHA256, &salt);
+        let pseudo_random_key = hkdf_salt.extract(shared_secret);
+
+        let mut expanded_secret = [0u8; 96]; // WhatsApp mengembangkan hingga 96 byte
+        pseudo_random_key.expand(&[], &mut expanded_secret)
+            .map_err(|_| "Failed to expand shared secret")?;
+
+        let enc_key = expanded_secret[0..32].to_vec();
+        let mac_key = expanded_secret[32..64].to_vec();
+
+        Ok(crate::crypto::SessionKeys {
+            enc_key,
+            mac_key,
+        })
+    }
+}
