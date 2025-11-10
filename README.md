@@ -36,7 +36,7 @@ Tambahkan ini ke `Cargo.toml` Anda:
 
 ```toml
 [dependencies]
-rustdi = "0.10.0"
+rustdi = "0.1.0"
 ```
 
 ## Quick Start
